@@ -39,8 +39,8 @@ int getrandom_exact(uint8_t* buf, size_t len) {
 }
 
 int main(int argc, char** argv) {
-  if (argc != 3) {
-    fprintf(stderr, "Usage: %s <keyfile> <messagefile>\n", argv[0]);
+  if (argc < 2 || argc >= 4) {
+    fprintf(stderr, "Usage: %s <keyfile> [messagefile]\n", argv[0]);
     return EXIT_FAILURE;
   }
 
@@ -74,7 +74,7 @@ int main(int argc, char** argv) {
   close(keyfd);
 
   int msgfd;
-  if (argv[2][0] == '-' && argv[2][1] == 0) {
+  if (argc == 2 || (argv[2][0] == '-' && argv[2][1] == 0)) {
     msgfd = STDIN_FILENO;
   } else {
     msgfd = open(argv[2], O_RDONLY);
@@ -87,29 +87,25 @@ int main(int argc, char** argv) {
   /**
    * Key preparation
    */
-  __m128i tr0 = _mm_castps_si128(_mm_broadcast_ss((float const*) &key[16])); // r0, r0, r0, r0
-  __m256i r0 = _mm256_cvtepu32_epi64(tr0);
+  __m128i r = _mm_load_si128((__m128i const*) (key + 16));
+  __m256i rr = _mm256_broadcastsi128_si256(r);
+  _mm256_slli_si256(rr, 4); // rr = (r1, r2, r3, r0, r1, r2, r3, 0)
 
-  __m128i tr1 = _mm_castps_si128(_mm_broadcast_ss((float const*) &key[20]));
-  __m128i shiftparam = _mm_set_epi32(0, 0, 0, 2);
-  __m128i mulparam = _mm_set_epi32(1, 1, 1, 5);
-  tr1 = _mm_srlv_epi32(tr1, shiftparam);
-  tr1 = _mm_mullo_epi32(tr1, mulparam); // r1, r1, r1, 5/4 r1
-  __m256i r1 = _mm256_cvtepu32_epi64(tr1);
+  __m256i shiftparam = _mm256_set_epi32(0, 0, 0, 0, 0, 2, 2, 2);
+  __m256i mulparam = _mm256_set_epi32(32, 32, 32, 32, 32, 2, 2, 2);
+  __m256i t;
+  rr = _mm256_srlv_epi32(rr, shiftparam);
+  t = _mm256_sllv_epi32(rr, mulparam);
+  rr = _mm256_add_epi32(rr, t);
 
-  __m128i tr2 = _mm_castps_si128(_mm_broadcast_ss((float const*) &key[24]));
-  shiftparam = _mm_insert_epi32(shiftparam, 2, 1);
-  mulparam = _mm_insert_epi32(mulparam, 5, 1);
-  tr2 = _mm_srlv_epi32(tr2, shiftparam);
-  tr2 = _mm_mullo_epi32(tr2, mulparam); // r2, r2, 5/4 r2, 5/4 r2
-  __m256i r2 = _mm256_cvtepu32_epi64(tr2);
-
-  __m128i tr3 = _mm_castps_si128(_mm_broadcast_ss((float const*) &key[28]));
-  shiftparam = _mm_insert_epi32(shiftparam, 2, 2);
-  mulparam = _mm_insert_epi32(mulparam, 5, 2);
-  tr3 = _mm_srlv_epi32(tr3, shiftparam);
-  tr3 = _mm_mullo_epi32(tr3, mulparam); // r3, 5/4 r3, 5/4 r3, 5/4 r3
-  __m256i r3 = _mm256_cvtepu32_epi64(tr3);
+  // (r0, r0, r0, r0)
+  __m256i r0 = _mm256_permutevar8x32_epi32(rr, _mm256_set_epi32(7, 3, 7, 3, 7, 3, 7, 3));
+  // (5/4 r1, r1, r1, r1)
+  __m256i r1 = _mm256_permutevar8x32_epi32(rr, _mm256_set_epi32(7, 4, 7, 4, 7, 4, 7, 0));
+  // (5/4 r2, 5/4 r1, r1, r1)
+  __m256i r2 = _mm256_permutevar8x32_epi32(rr, _mm256_set_epi32(7, 5, 7, 5, 7, 1, 7, 1));
+  // (5/4 r3, 5/4 r1, 5/4 r1, r1)
+  __m256i r3 = _mm256_permutevar8x32_epi32(rr, _mm256_set_epi32(7, 6, 7, 2, 7, 2, 7, 2));
 
   /**
    * Compute AES_k(n)
@@ -143,7 +139,7 @@ int main(int argc, char** argv) {
   uint8_t* eob = NULL;
   while (current != eob) {
     if (current == buf + bufsize) {
-      size_t read_count = read_exact(STDIN_FILENO, buf, bufsize);
+      size_t read_count = read_exact(msgfd, buf, bufsize);
       if (read_count < sizeof(buf)) {
         size_t eob_offset = (read_count + 15) / 16 * 16;
         if (eob_offset != read_count) {
@@ -161,24 +157,31 @@ int main(int argc, char** argv) {
       }
     }
 
+    // load 4x 32-bit messages and zero-extend to 64-bit
     __m128i data128 = _mm_load_si128((__m128i const *) current);
     __m256i data = _mm256_cvtepu32_epi64(data128);
     if (eob - current >= 16) {
-      data = _mm256_insert_epi32(data, 1, 7);
+      data = _mm256_insert_epi32(data, 1, 7); // per-message padding
     }
-    h = _mm256_add_epi64(h, data); // h := h + c
+    h = _mm256_add_epi64(h, data); // h <- h + c
 
+    // AVX-2 doesn't have u64*u32 multiplication, so we must split 64-bit integers into two parts.
+    // We have u32*u32 -> u64 mult (vpmuludq), so split into two 32-bit integers.
+    // Basically we compute h[31:0]*r[31:0] + ((h[63:32]*r[31:0]) << 32), then it's equivalent to
+    // h[63:0]*r[31:0]
+
+    // hu <- 4x h[63:32], h <- 4x h[31:0] (do nothing for h, since vpmuludq ignores upper 32 bits)
     __m256i hu = _mm256_srli_epi64(h, 32);
     __m256i ml, mu, ret;
 
-    // 0
+    // ret <- (r0*h0, r0*h1, r0*h2, r0*h3)
     ret = _mm256_mul_epu32(h, r0);
     mu = _mm256_mul_epu32(hu, r0);
     mu = _mm256_slli_epi64(mu, 32);
     ret = _mm256_add_epi32(ret, mu);
 
-    // 1
-    h = _mm256_permute4x64_epi64(h, 0x93); // 10 01 00 11
+    // ret <- ret + (5/4 r1*h3, r1*h0, r1*h1, r1*h2)
+    h = _mm256_permute4x64_epi64(h, 0x93); // 10 01 00 11; rotate left once
     hu = _mm256_permute4x64_epi64(hu, 0x93);
     ml = _mm256_mul_epu32(h, r1);
     ret = _mm256_add_epi64(ret, ml);
@@ -186,7 +189,7 @@ int main(int argc, char** argv) {
     mu = _mm256_slli_epi64(mu, 32);
     ret = _mm256_add_epi32(ret, mu);
 
-    // 2
+    // ret <- ret + (5/4 r2*h2, 5/4 r2*h3, r1*h0, r1*h1)
     h = _mm256_permute4x64_epi64(h, 0x93);
     hu = _mm256_permute4x64_epi64(hu, 0x93);
     ml = _mm256_mul_epu32(h, r2);
@@ -195,7 +198,7 @@ int main(int argc, char** argv) {
     mu = _mm256_slli_epi64(mu, 32);
     ret = _mm256_add_epi32(ret, mu);
 
-    // 3
+    // ret <- ret + (5/4 r3*h1, 5/4 r3*h2, 5/4 r3*h1, r1*h0)
     h = _mm256_permute4x64_epi64(h, 0x93);
     hu = _mm256_permute4x64_epi64(hu, 0x93);
     ml = _mm256_mul_epu32(h, r3);
@@ -204,17 +207,23 @@ int main(int argc, char** argv) {
     mu = _mm256_slli_epi64(mu, 32);
     ret = _mm256_add_epi32(ret, mu);
 
-    // now ret := r * h
-    // do carry
-    __m256i shiftparam = _mm256_set_epi64x(34, 32, 32, 32);
-    __m256i mulparam = _mm256_set_epi64x(5, 1, 1, 1);
-    hu = _mm256_srlv_epi64(ret, shiftparam);
-    hu = _mm256_mul_epu32(hu, mulparam);
-    hu = _mm256_permute4x64_epi64(hu, 0x93);
+    // now ret is r*h
+    // perform parallel carry
+    __m256i carry_mover = _mm256_set_epi64x(34, 32, 32, 32);
+    __m256i carry_mult_mover = _mm256_set_epi64x(1, 64, 64, 64);
+    // here we compute 5*h3[63:34] = (1 + 4)*h3[63:34], as we're on p=2^130-5
+    // then rotate left once, in order to move carries to the right place
+    __m256i carry = _mm256_srlv_epi64(ret, carry_mover);
+    __m256i carry2 = _mm256_sllv_epi64(carry, carry_mult_mover);
+    carry = _mm256_add_epi64(carry, carry2);
+    carry = _mm256_permute4x64_epi64(carry, 0x93);
+
+    // mask out carries
     __m256i mask = _mm256_set1_epi64x(0xffffffffLL);
     mask = _mm256_insert_epi32(mask, 0x03, 7);
     ret = _mm256_and_si256(ret, mask);
-    h = _mm256_add_epi64(ret, hu);
+
+    h = _mm256_add_epi64(ret, carry);
 
     current += 0x10;
   }
@@ -236,7 +245,8 @@ int main(int argc, char** argv) {
   // Need to subtract 2^130-5 if the result >= 2^130-5
   // We do this by adding 5 and taking lower 130 bits, when h >= 2^130-5
   // After that we add AES_k(n)
-  int need_subtract = (h3 == 0x3ffffffffULL) & (h2 == 0xffffffffULL) & (h1 == 0xffffffffULL) & (h0 >= 0xfffffffbULL);
+  int need_subtract = (h3 > 0x3ffffffffULL) |
+    ((h3 == 0x3ffffffffULL) & (h2 == 0xffffffffULL) & (h1 == 0xffffffffULL) & (h0 >= 0xfffffffbULL));
   h0 += need_subtract * 5 + (unsigned int) _mm_extract_epi32(aes_n, 0);
   h1 += (h0 >> 32) + (unsigned int) _mm_extract_epi32(aes_n, 1);
   h2 += (h1 >> 32) + (unsigned int) _mm_extract_epi32(aes_n, 2);
