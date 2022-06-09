@@ -91,11 +91,9 @@ int main(int argc, char** argv) {
   __m256i rr = _mm256_broadcastsi128_si256(r);
   _mm256_slli_si256(rr, 4); // rr = (r1, r2, r3, r0, r1, r2, r3, 0)
 
-  __m256i shiftparam = _mm256_set_epi32(0, 0, 0, 0, 0, 2, 2, 2);
-  __m256i mulparam = _mm256_set_epi32(32, 32, 32, 32, 32, 2, 2, 2);
   __m256i t;
-  rr = _mm256_srlv_epi32(rr, shiftparam);
-  t = _mm256_sllv_epi32(rr, mulparam);
+  rr = _mm256_srlv_epi32(rr, _mm256_set_epi32(0, 0, 0, 0, 0, 2, 2, 2));
+  t = _mm256_sllv_epi32(rr, _mm256_set_epi32(32, 32, 32, 32, 32, 2, 2, 2));
   rr = _mm256_add_epi32(rr, t);
 
   // (r0, r0, r0, r0)
@@ -207,20 +205,16 @@ int main(int argc, char** argv) {
     mu = _mm256_slli_epi64(mu, 32);
     ret = _mm256_add_epi32(ret, mu);
 
-    // now ret is r*h
-    // perform parallel carry
-    __m256i carry_mover = _mm256_set_epi64x(34, 32, 32, 32);
-    __m256i carry_mult_mover = _mm256_set_epi64x(1, 64, 64, 64);
+    // now ret is r*h, perform parallel carry
     // here we compute 5*h3[63:34] = (1 + 4)*h3[63:34], as we're on p=2^130-5
     // then rotate left once, in order to move carries to the right place
-    __m256i carry = _mm256_srlv_epi64(ret, carry_mover);
-    __m256i carry2 = _mm256_sllv_epi64(carry, carry_mult_mover);
+    __m256i carry = _mm256_srlv_epi64(ret, _mm256_set_epi64x(34, 32, 32, 32));
+    __m256i carry2 = _mm256_sllv_epi64(carry, _mm256_set_epi64x(1, 64, 64, 64));
     carry = _mm256_add_epi64(carry, carry2);
     carry = _mm256_permute4x64_epi64(carry, 0x93);
 
     // mask out carries
-    __m256i mask = _mm256_set1_epi64x(0xffffffffLL);
-    mask = _mm256_insert_epi32(mask, 0x03, 7);
+    __m256i mask = _mm256_set_epi64x(0x3ffffffffLL, 0xffffffffLL, 0xffffffffULL, 0xffffffffULL);
     ret = _mm256_and_si256(ret, mask);
 
     h = _mm256_add_epi64(ret, carry);
