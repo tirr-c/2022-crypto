@@ -115,7 +115,7 @@ int main(int argc, char** argv) {
    * Compute AES_k(n)
    */
   uint8_t nonce[16];
-  getrandom_exact(nonce, 16);
+  getrandom_exact(nonce, sizeof(nonce));
 
   __m128i n = _mm_load_si128((__m128i const*) nonce);
   __m128i k = _mm_load_si128((__m128i const*) key);
@@ -136,13 +136,14 @@ int main(int argc, char** argv) {
    * Main loop
    * Repetedly computes h <- r(h + c_i)
    */
-  uint8_t buf[4096];
+  size_t bufsize = 32768;
+  uint8_t* buf = malloc(bufsize);
   __m256i h = _mm256_setzero_si256();
-  uint8_t* current = buf + 4096;
+  uint8_t* current = buf + bufsize;
   uint8_t* eob = NULL;
   while (current != eob) {
-    if (current == buf + 4096) {
-      size_t read_count = read_exact(STDIN_FILENO, buf, sizeof(buf));
+    if (current == buf + bufsize) {
+      size_t read_count = read_exact(STDIN_FILENO, buf, bufsize);
       if (read_count < sizeof(buf)) {
         size_t eob_offset = (read_count + 15) / 16 * 16;
         if (eob_offset != read_count) {
@@ -155,7 +156,7 @@ int main(int argc, char** argv) {
       }
 
       current = buf;
-      if (current != eob) {
+      if (current == eob) {
         break;
       }
     }
@@ -246,6 +247,14 @@ int main(int argc, char** argv) {
   uint32_t o1 = (uint32_t) h1;
   uint32_t o2 = (uint32_t) h2;
   uint32_t o3 = (uint32_t) h3;
-  printf("%08x%08x%08x%08x\n", o3, o2, o1, o0);
+
+  printf("Nonce:");
+  for (int i = 0; i < 16; i++) {
+    printf(" %02x", nonce[i]);
+  }
+  printf("\n");
+  printf("MAC: %08x%08x%08x%08x\n", o3, o2, o1, o0);
+
+  free(buf);
   return 0;
 }
