@@ -42,8 +42,8 @@ int poly1305_prepare_key(const uint8_t key[32], struct poly1305_key* out) {
     return -1;
   }
 
-  __m128i k = _mm_load_si128((__m128i const*) key);
-  __m128i r = _mm_load_si128((__m128i const*) (key + 16));
+  __m128i k = _mm_loadu_si128((__m128i const*) key);
+  __m128i r = _mm_loadu_si128((__m128i const*) (key + 16));
   __m256i rr = _mm256_broadcastsi128_si256(r); // rr = (r0, r1, r2, r3, r0, r1, r2, r3)
 
   __m256i t;
@@ -101,7 +101,7 @@ static __m256i poly1305_update(struct poly1305_key const* key,
   uint8_t const* eob = buf + (len & ~0x0f);
   while (current != eob) {
     // load 4x 32-bit messages and zero-extend to 64-bit
-    __m128i data128 = _mm_load_si128((__m128i const *) current);
+    __m128i data128 = _mm_loadu_si128((__m128i const *) current);
     __m256i data = _mm256_cvtepu32_epi64(data128);
     data = _mm256_insert_epi32(data, 1, 7); // per-message padding
     h = _mm256_add_epi64(h, data); // h <- h + c
@@ -197,11 +197,11 @@ static void poly1305_finalize(struct poly1305_key const* key,
     // load 4x 32-bit messages and zero-extend to 64-bit
     __m256i data;
     if (current < eob) {
-      __m128i data128 = _mm_load_si128((__m128i const *) current);
+      __m128i data128 = _mm_loadu_si128((__m128i const *) current);
       data = _mm256_cvtepu32_epi64(data128);
       data = _mm256_insert_epi32(data, 1, 7); // per-message padding
     } else if (last_message != NULL) {
-      __m128i data128 = _mm_load_si128((__m128i const *) last_message);
+      __m128i data128 = _mm_loadu_si128((__m128i const *) last_message);
       data = _mm256_cvtepu32_epi64(data128);
       last_message = NULL;
     } else {
@@ -286,7 +286,7 @@ static void poly1305_finalize(struct poly1305_key const* key,
   // We do this by adding 5 and taking lower 130 bits, when h >= 2^130-5
   // After that we add AES_k(n)
   __m128i k = _mm_load_si128(&key->aes_k);
-  __m128i n = _mm_load_si128((__m128i const*) &out->nonce);
+  __m128i n = _mm_loadu_si128((__m128i const*) &out->nonce);
   __m128i aes_n = poly1305_aes_k(k, n);
   int need_subtract = (h3 > 0x3ffffffffULL) |
     ((h3 == 0x3ffffffffULL) & (h2 == 0xffffffffULL) & (h1 == 0xffffffffULL) & (h0 >= 0xfffffffbULL));
