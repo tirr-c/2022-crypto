@@ -5,19 +5,6 @@
 #include "../util.h"
 #include "poly1305.h"
 
-#define PRINT_M256I(v) { \
-  long long t; \
-  printf("%6s: ", #v); \
-  t = _mm256_extract_epi64(v, 3); \
-  printf(" %016llx", t); \
-  t = _mm256_extract_epi64(v, 2); \
-  printf(" %016llx", t); \
-  t = _mm256_extract_epi64(v, 1); \
-  printf(" %016llx", t); \
-  t = _mm256_extract_epi64(v, 0); \
-  printf(" %016llx\n", t); \
-}
-
 #define AES_ONCE(s, k, rcon, intr) { \
   __m128i rk; \
   rk = _mm_aeskeygenassist_si128(k, rcon); \
@@ -44,36 +31,29 @@ int poly1305_prepare_key(const uint8_t key[32], struct poly1305_key* out) {
 
   __m128i k = _mm_loadu_si128((__m128i const*) key);
   __m128i r = _mm_loadu_si128((__m128i const*) (key + 16));
-  __m256i rr = _mm256_broadcastsi128_si256(r); // rr = (r0, r1, r2, r3, r0, r1, r2, r3)
+  __m128i r54 = _mm_srli_epi32(r, 2);
+  r54 = _mm_add_epi32(r54, r);
+  __m256i rr = _mm256_set_m128i(r54, r);
+  // now rr = (r0, r1, r2, r3, 5/4 r0 [inexact, unused], 5/4 r1, 5/4 r2, 5/4 r3)
 
-  __m256i t;
-  rr = _mm256_srlv_epi32(rr, _mm256_set_epi32(2, 2, 2, 2, 0, 0, 0, 0));
-  t = _mm256_sllv_epi32(rr, _mm256_set_epi32(2, 2, 2, 2, 32, 32, 32, 32));
-  rr = _mm256_add_epi32(rr, t);
+  // (r0, r0, r0, r0, 5/4 r1, r1, r1, r1)
+  __m256i r0r1 = _mm256_permutevar8x32_epi32(rr, _mm256_set_epi32(1, 1, 1, 5, 0, 0, 0, 0));
+  __m128i r0 = _mm256_extractf128_si256(r0r1, 0);
+  __m128i r1 = _mm256_extractf128_si256(r0r1, 1);
+  __m256i r2r3 = _mm256_permutevar8x32_epi32(rr, _mm256_set_epi32(3, 7, 7, 7, 2, 2, 6, 6));
+  __m128i r2 = _mm256_extractf128_si256(r2r3, 0);
+  __m128i r3 = _mm256_extractf128_si256(r2r3, 1);
 
-  // (r0, r0, r0, r0)
-  __m256i r0 = _mm256_permutevar8x32_epi32(rr, _mm256_set_epi32(0, 0, 0, 0, 0, 0, 0, 0));
-  r0 = _mm256_srli_epi64(r0, 32);
-  // (5/4 r1, r1, r1, r1)
-  __m256i r1 = _mm256_permutevar8x32_epi32(rr, _mm256_set_epi32(1, 1, 1, 1, 1, 1, 5, 5));
-  r1 = _mm256_srli_epi64(r1, 32);
-  // (5/4 r2, 5/4 r2, r2, r2)
-  __m256i r2 = _mm256_permutevar8x32_epi32(rr, _mm256_set_epi32(2, 2, 2, 2, 6, 6, 6, 6));
-  r2 = _mm256_srli_epi64(r2, 32);
-  // (5/4 r3, 5/4 r3, 5/4 r3, r3)
-  __m256i r3 = _mm256_permutevar8x32_epi32(rr, _mm256_set_epi32(3, 3, 7, 7, 7, 7, 7, 7));
-  r3 = _mm256_srli_epi64(r3, 32);
-
-  _mm256_store_si256(&out->r0, r0);
-  _mm256_store_si256(&out->r1, r1);
-  _mm256_store_si256(&out->r2, r2);
-  _mm256_store_si256(&out->r3, r3);
+  _mm_store_si128(&out->r0, r0);
+  _mm_store_si128(&out->r1, r1);
+  _mm_store_si128(&out->r2, r2);
+  _mm_store_si128(&out->r3, r3);
   _mm_store_si128(&out->aes_k, k);
 
   return 0;
 }
 
-static __m128i poly1305_aes_k(__m128i k, __m128i n) {
+static inline __m128i poly1305_aes_k(__m128i k, __m128i n) {
   __m128i aes_n = _mm_xor_si128(n, k);
   AES_ONCE(aes_n, k, 0x01, _mm_aesenc_si128);
   AES_ONCE(aes_n, k, 0x02, _mm_aesenc_si128);
@@ -88,80 +68,87 @@ static __m128i poly1305_aes_k(__m128i k, __m128i n) {
   return aes_n;
 }
 
+static inline __m256i
+poly1305_round(__m256i h, __m256i c, __m256i r0, __m256i r1, __m256i r2, __m256i r3)
+{
+  // h <- h + c
+  h = _mm256_add_epi64(h, c);
+
+  // AVX-2 doesn't have u64*u32 multiplication, so we must split 64-bit integers into two parts.
+  // We have 4x u32*u32 -> u64 mult (vpmuludq), so split into two 32-bit integers.
+  // Basically we compute h[31:0]*r[31:0] + ((h[63:32]*r[31:0]) << 32), then it's equivalent to
+  // h[63:0]*r[31:0]
+
+  // hu <- 4x h[63:32], h <- 4x h[31:0] (do nothing for h, since vpmuludq ignores upper 32 bits)
+  __m256i hu = _mm256_srli_epi64(h, 32);
+  __m256i ml, mu, ret;
+
+  // ret <- (r0*h0, r0*h1, r0*h2, r0*h3)
+  ret = _mm256_mul_epu32(h, r0);
+  mu = _mm256_mul_epu32(hu, r0);
+  mu = _mm256_slli_epi64(mu, 32);
+  ret = _mm256_add_epi32(ret, mu);
+
+  // ret <- ret + (5/4 r1*h3, r1*h0, r1*h1, r1*h2)
+  h = _mm256_permute4x64_epi64(h, 0x93); // 10 01 00 11; rotate h left once
+  hu = _mm256_permute4x64_epi64(hu, 0x93);
+  ml = _mm256_mul_epu32(h, r1);
+  ret = _mm256_add_epi64(ret, ml);
+  mu = _mm256_mul_epu32(hu, r1);
+  mu = _mm256_slli_epi64(mu, 32);
+  ret = _mm256_add_epi32(ret, mu);
+
+  // ret <- ret + (5/4 r2*h2, 5/4 r2*h3, r2*h0, r2*h1)
+  h = _mm256_permute4x64_epi64(h, 0x93);
+  hu = _mm256_permute4x64_epi64(hu, 0x93);
+  ml = _mm256_mul_epu32(h, r2);
+  ret = _mm256_add_epi64(ret, ml);
+  mu = _mm256_mul_epu32(hu, r2);
+  mu = _mm256_slli_epi64(mu, 32);
+  ret = _mm256_add_epi32(ret, mu);
+
+  // ret <- ret + (5/4 r3*h1, 5/4 r3*h2, 5/4 r3*h3, r3*h0)
+  h = _mm256_permute4x64_epi64(h, 0x93);
+  hu = _mm256_permute4x64_epi64(hu, 0x93);
+  ml = _mm256_mul_epu32(h, r3);
+  ret = _mm256_add_epi64(ret, ml);
+  mu = _mm256_mul_epu32(hu, r3);
+  mu = _mm256_slli_epi64(mu, 32);
+  ret = _mm256_add_epi32(ret, mu);
+
+  // now ret is r*h, perform parallel carry
+  // here we compute 5*h3[63:34] = (1 + 4)*h3[63:34], as we're on p=2^130-5
+  // then rotate left once, in order to move carries to the right place
+  __m256i carry = _mm256_srlv_epi64(ret, _mm256_set_epi64x(34, 32, 32, 32));
+  __m256i carry2 = _mm256_sllv_epi64(carry, _mm256_set_epi64x(2, 64, 64, 64));
+  carry = _mm256_add_epi64(carry, carry2);
+  carry = _mm256_permute4x64_epi64(carry, 0x93);
+
+  // mask out carries
+  __m256i mask = _mm256_set_epi64x(0x3ffffffffLL, 0xffffffffLL, 0xffffffffLL, 0xffffffffLL);
+  ret = _mm256_and_si256(ret, mask);
+
+  return _mm256_add_epi64(ret, carry);
+}
+
 static __m256i poly1305_update(struct poly1305_key const* key,
                                __m256i h,
                                uint8_t const* buf,
                                size_t len)
 {
-  __m256i r0 = _mm256_load_si256(&key->r0);
-  __m256i r1 = _mm256_load_si256(&key->r1);
-  __m256i r2 = _mm256_load_si256(&key->r2);
-  __m256i r3 = _mm256_load_si256(&key->r3);
+  __m256i r0 = _mm256_cvtepu32_epi64(_mm_load_si128(&key->r0));
+  __m256i r1 = _mm256_cvtepu32_epi64(_mm_load_si128(&key->r1));
+  __m256i r2 = _mm256_cvtepu32_epi64(_mm_load_si128(&key->r2));
+  __m256i r3 = _mm256_cvtepu32_epi64(_mm_load_si128(&key->r3));
   uint8_t const* current = buf;
   uint8_t const* eob = buf + (len & ~0x0f);
   while (current != eob) {
     // load 4x 32-bit messages and zero-extend to 64-bit
-    __m128i data128 = _mm_loadu_si128((__m128i const *) current);
-    __m256i data = _mm256_cvtepu32_epi64(data128);
-    data = _mm256_insert_epi32(data, 1, 7); // per-message padding
-    h = _mm256_add_epi64(h, data); // h <- h + c
+    __m128i c128 = _mm_loadu_si128((__m128i const *) current);
+    __m256i c = _mm256_cvtepu32_epi64(c128);
+    c = _mm256_insert_epi32(c, 1, 7); // per-message padding
 
-    // AVX-2 doesn't have u64*u32 multiplication, so we must split 64-bit integers into two parts.
-    // We have u32*u32 -> u64 mult (vpmuludq), so split into two 32-bit integers.
-    // Basically we compute h[31:0]*r[31:0] + ((h[63:32]*r[31:0]) << 32), then it's equivalent to
-    // h[63:0]*r[31:0]
-
-    // hu <- 4x h[63:32], h <- 4x h[31:0] (do nothing for h, since vpmuludq ignores upper 32 bits)
-    __m256i hu = _mm256_srli_epi64(h, 32);
-    __m256i ml, mu, ret;
-
-    // ret <- (r0*h0, r0*h1, r0*h2, r0*h3)
-    ret = _mm256_mul_epu32(h, r0);
-    mu = _mm256_mul_epu32(hu, r0);
-    mu = _mm256_slli_epi64(mu, 32);
-    ret = _mm256_add_epi32(ret, mu);
-
-    // ret <- ret + (5/4 r1*h3, r1*h0, r1*h1, r1*h2)
-    h = _mm256_permute4x64_epi64(h, 0x93); // 10 01 00 11; rotate left once
-    hu = _mm256_permute4x64_epi64(hu, 0x93);
-    ml = _mm256_mul_epu32(h, r1);
-    ret = _mm256_add_epi64(ret, ml);
-    mu = _mm256_mul_epu32(hu, r1);
-    mu = _mm256_slli_epi64(mu, 32);
-    ret = _mm256_add_epi32(ret, mu);
-
-    // ret <- ret + (5/4 r2*h2, 5/4 r2*h3, r2*h0, r2*h1)
-    h = _mm256_permute4x64_epi64(h, 0x93);
-    hu = _mm256_permute4x64_epi64(hu, 0x93);
-    ml = _mm256_mul_epu32(h, r2);
-    ret = _mm256_add_epi64(ret, ml);
-    mu = _mm256_mul_epu32(hu, r2);
-    mu = _mm256_slli_epi64(mu, 32);
-    ret = _mm256_add_epi32(ret, mu);
-
-    // ret <- ret + (5/4 r3*h1, 5/4 r3*h2, 5/4 r3*h3, r3*h0)
-    h = _mm256_permute4x64_epi64(h, 0x93);
-    hu = _mm256_permute4x64_epi64(hu, 0x93);
-    ml = _mm256_mul_epu32(h, r3);
-    ret = _mm256_add_epi64(ret, ml);
-    mu = _mm256_mul_epu32(hu, r3);
-    mu = _mm256_slli_epi64(mu, 32);
-    ret = _mm256_add_epi32(ret, mu);
-
-    // now ret is r*h, perform parallel carry
-    // here we compute 5*h3[63:34] = (1 + 4)*h3[63:34], as we're on p=2^130-5
-    // then rotate left once, in order to move carries to the right place
-    __m256i carry = _mm256_srlv_epi64(ret, _mm256_set_epi64x(34, 32, 32, 32));
-    __m256i carry2 = _mm256_sllv_epi64(carry, _mm256_set_epi64x(2, 64, 64, 64));
-    carry = _mm256_add_epi64(carry, carry2);
-    carry = _mm256_permute4x64_epi64(carry, 0x93);
-
-    // mask out carries
-    __m256i mask = _mm256_set_epi64x(0x3ffffffffLL, 0xffffffffLL, 0xffffffffULL, 0xffffffffULL);
-    ret = _mm256_and_si256(ret, mask);
-
-    h = _mm256_add_epi64(ret, carry);
-
+    h = poly1305_round(h, c, r0, r1, r2, r3);
     current += 0x10;
   }
 
@@ -189,82 +176,26 @@ static void poly1305_finalize(struct poly1305_key const* key,
   }
 
   uint32_t* tag = (uint32_t*) out->tag;
-  __m256i r0 = _mm256_load_si256(&key->r0);
-  __m256i r1 = _mm256_load_si256(&key->r1);
-  __m256i r2 = _mm256_load_si256(&key->r2);
-  __m256i r3 = _mm256_load_si256(&key->r3);
+  __m256i r0 = _mm256_cvtepu32_epi64(_mm_load_si128(&key->r0));
+  __m256i r1 = _mm256_cvtepu32_epi64(_mm_load_si128(&key->r1));
+  __m256i r2 = _mm256_cvtepu32_epi64(_mm_load_si128(&key->r2));
+  __m256i r3 = _mm256_cvtepu32_epi64(_mm_load_si128(&key->r3));
   while (1) {
     // load 4x 32-bit messages and zero-extend to 64-bit
-    __m256i data;
+    __m256i c;
     if (current < eob) {
-      __m128i data128 = _mm_loadu_si128((__m128i const *) current);
-      data = _mm256_cvtepu32_epi64(data128);
-      data = _mm256_insert_epi32(data, 1, 7); // per-message padding
+      __m128i c128 = _mm_loadu_si128((__m128i const *) current);
+      c = _mm256_cvtepu32_epi64(c128);
+      c = _mm256_insert_epi32(c, 1, 7); // per-message padding
     } else if (last_message != NULL) {
       __m128i data128 = _mm_loadu_si128((__m128i const *) last_message);
-      data = _mm256_cvtepu32_epi64(data128);
+      c = _mm256_cvtepu32_epi64(data128);
       last_message = NULL;
     } else {
       break;
     }
-    h = _mm256_add_epi64(h, data); // h <- h + c
 
-    // AVX-2 doesn't have u64*u32 multiplication, so we must split 64-bit integers into two parts.
-    // We have u32*u32 -> u64 mult (vpmuludq), so split into two 32-bit integers.
-    // Basically we compute h[31:0]*r[31:0] + ((h[63:32]*r[31:0]) << 32), then it's equivalent to
-    // h[63:0]*r[31:0]
-
-    // hu <- 4x h[63:32], h <- 4x h[31:0] (do nothing for h, since vpmuludq ignores upper 32 bits)
-    __m256i hu = _mm256_srli_epi64(h, 32);
-    __m256i ml, mu, ret;
-
-    // ret <- (r0*h0, r0*h1, r0*h2, r0*h3)
-    ret = _mm256_mul_epu32(h, r0);
-    mu = _mm256_mul_epu32(hu, r0);
-    mu = _mm256_slli_epi64(mu, 32);
-    ret = _mm256_add_epi32(ret, mu);
-
-    // ret <- ret + (5/4 r1*h3, r1*h0, r1*h1, r1*h2)
-    h = _mm256_permute4x64_epi64(h, 0x93); // 10 01 00 11; rotate left once
-    hu = _mm256_permute4x64_epi64(hu, 0x93);
-    ml = _mm256_mul_epu32(h, r1);
-    ret = _mm256_add_epi64(ret, ml);
-    mu = _mm256_mul_epu32(hu, r1);
-    mu = _mm256_slli_epi64(mu, 32);
-    ret = _mm256_add_epi32(ret, mu);
-
-    // ret <- ret + (5/4 r2*h2, 5/4 r2*h3, r2*h0, r2*h1)
-    h = _mm256_permute4x64_epi64(h, 0x93);
-    hu = _mm256_permute4x64_epi64(hu, 0x93);
-    ml = _mm256_mul_epu32(h, r2);
-    ret = _mm256_add_epi64(ret, ml);
-    mu = _mm256_mul_epu32(hu, r2);
-    mu = _mm256_slli_epi64(mu, 32);
-    ret = _mm256_add_epi32(ret, mu);
-
-    // ret <- ret + (5/4 r3*h1, 5/4 r3*h2, 5/4 r3*h3, r3*h0)
-    h = _mm256_permute4x64_epi64(h, 0x93);
-    hu = _mm256_permute4x64_epi64(hu, 0x93);
-    ml = _mm256_mul_epu32(h, r3);
-    ret = _mm256_add_epi64(ret, ml);
-    mu = _mm256_mul_epu32(hu, r3);
-    mu = _mm256_slli_epi64(mu, 32);
-    ret = _mm256_add_epi32(ret, mu);
-
-    // now ret is r*h, perform parallel carry
-    // here we compute 5*h3[63:34] = (1 + 4)*h3[63:34], as we're on p=2^130-5
-    // then rotate left once, in order to move carries to the right place
-    __m256i carry = _mm256_srlv_epi64(ret, _mm256_set_epi64x(34, 32, 32, 32));
-    __m256i carry2 = _mm256_sllv_epi64(carry, _mm256_set_epi64x(2, 64, 64, 64));
-    carry = _mm256_add_epi64(carry, carry2);
-    carry = _mm256_permute4x64_epi64(carry, 0x93);
-
-    // mask out carries
-    __m256i mask = _mm256_set_epi64x(0x3ffffffffLL, 0xffffffffLL, 0xffffffffULL, 0xffffffffULL);
-    ret = _mm256_and_si256(ret, mask);
-
-    h = _mm256_add_epi64(ret, carry);
-
+    h = poly1305_round(h, c, r0, r1, r2, r3);
     current += 0x10;
   }
 

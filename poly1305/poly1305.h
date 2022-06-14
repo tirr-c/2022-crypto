@@ -5,11 +5,12 @@
 #include <immintrin.h>
 
 struct poly1305_key {
-  __m256i r0;
-  __m256i r1;
-  __m256i r2;
-  __m256i r3;
+  __m128i r0;
+  __m128i r1;
+  __m128i r2;
+  __m128i r3;
   __m128i aes_k;
+  __m128i padding[3];
 };
 
 struct poly1305_tag {

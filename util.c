@@ -2,8 +2,22 @@
 #include <unistd.h>
 #include <errno.h>
 #include <immintrin.h>
+#include <sys/random.h>
 
 #include "util.h"
+
+int getrandom_exact(uint8_t* buf, size_t len) {
+  size_t count = 0;
+  while (count < len) {
+    ssize_t ret = getrandom(buf + count, len - count, 0);
+    if (ret < 0) {
+      if (errno == EINTR) continue;
+      return -1;
+    }
+    count += ret;
+  }
+  return 0;
+}
 
 ssize_t read_exact(int fd, void* buf, size_t count) {
   size_t read_count = 0;

@@ -1,9 +1,21 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdalign.h>
+#include <time.h>
 
 #include "../util.h"
 #include "poly1305.h"
+
+static void generate_key(uint8_t* keybuf) {
+  getrandom_exact(keybuf, 32);
+  keybuf[0x13] &= 0x0f;
+  keybuf[0x14] &= 0xfc;
+  keybuf[0x17] &= 0x0f;
+  keybuf[0x18] &= 0xfc;
+  keybuf[0x1b] &= 0x0f;
+  keybuf[0x1c] &= 0xfc;
+  keybuf[0x1f] &= 0x0f;
+}
 
 static void print_tag(struct poly1305_tag const* tag) {
   printf("Nonce:");
@@ -23,6 +35,7 @@ int main() {
   struct poly1305_tag tag;
   int ret = 0;
 
+  printf("Sanity check...\n");
   {
     static char key[] = "\x75\xde\xaa\x25\xc0\x9f\x20\x8e\x1d\xc4\xce\x6b\x5c\xad\x3f\xbf\xa0\xf3\x08\x00\x00\xf4\x64\x00\xd0\xc7\xe9\x07\x6c\x83\x44\x03";
     static char msg[] = "";
@@ -54,6 +67,160 @@ int main() {
       ret = EXIT_FAILURE;
     }
   }
+  if (ret != 0) {
+    return ret;
+  }
 
-  return ret;
+  printf("Benchmark 1: single key, long message\n");
+  {
+    printf("Generating key...\n");
+    uint8_t keybuf[32];
+    generate_key(keybuf);
+
+    printf("Preparing zero-filled 1 GiB buffer...\n");
+    uint8_t* buf = malloc(1 * 1024 * 1024 * 1024);
+    memset(buf, 0, 1 * 1024 * 1024 * 1024);
+
+    printf("Performing authentication...\n");
+    struct poly1305_key key;
+    struct poly1305_tag tag;
+    memset(tag.nonce, 0, sizeof(tag.nonce));
+
+    for (int i = 0; i < 16; i++) {
+      tag.nonce[0] = i;
+
+      struct timespec start, current;
+      clock_gettime(CLOCK_MONOTONIC, &start);
+      poly1305_prepare_key(keybuf, &key);
+      poly1305_auth_once(&key, buf, 1 * 1024 * 1024 * 1024, &tag);
+      clock_gettime(CLOCK_MONOTONIC, &current);
+
+      print_tag(&tag);
+      current.tv_nsec -= start.tv_nsec;
+      current.tv_sec -= start.tv_sec;
+      if (current.tv_nsec < 0) {
+        current.tv_nsec += 1000000000LL;
+        current.tv_sec -= 1;
+      }
+      printf("Elapsed time: %jd.%09ld\n", (intmax_t) current.tv_sec, current.tv_nsec);
+    }
+
+    free(buf);
+  }
+
+  printf("\n");
+  printf("Benchmark 2: single key, multiple short messages\n");
+  {
+    printf("Generating key...\n");
+    uint8_t keybuf[32];
+    generate_key(keybuf);
+
+    int bufcount = 1024;
+    printf("Preparing %d random-filled 64 byte buffer...\n", bufcount);
+    uint8_t** bufs = calloc(bufcount, sizeof(uint8_t*));
+    for (int i = 0; i < bufcount; i++) {
+      bufs[i] = malloc(64);
+      getrandom_exact(bufs[i], 64);
+    }
+
+    printf("Performing authentication...\n");
+    struct poly1305_key key;
+    struct poly1305_tag tag;
+    memset(tag.nonce, 0, sizeof(tag.nonce));
+
+    struct timespec start, current;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    poly1305_prepare_key(keybuf, &key);
+    long iter = 0;
+    while (1) {
+      for (int p = 0; p < 16; p++) {
+        uint8_t b = ++tag.nonce[p];
+        if (b != 0) break;
+      }
+      poly1305_auth_once(&key, bufs[iter % bufcount], 64, &tag);
+      clock_gettime(CLOCK_MONOTONIC, &current);
+      if (current.tv_sec > start.tv_sec && current.tv_nsec >= start.tv_nsec) {
+        break;
+      }
+      iter++;
+    }
+
+    current.tv_nsec -= start.tv_nsec;
+    current.tv_sec -= start.tv_sec;
+    if (current.tv_nsec < 0) {
+      current.tv_nsec += 1000000000LL;
+      current.tv_sec -= 1;
+    }
+    printf("Processed 64 byte messages: %ld\n", iter);
+    printf("Elapsed time: %jd.%09ld\n", (intmax_t) current.tv_sec, current.tv_nsec);
+
+    for (int i = 0; i < bufcount; i++) {
+      free(bufs[i]);
+    }
+    free(bufs);
+  }
+
+  printf("\n");
+  printf("Benchmark 2: single key, multiple short messages\n");
+  {
+    int bufcount = 1024;
+
+    printf("Generating %d keys...\n", bufcount);
+    uint8_t** keybufs = calloc(bufcount, sizeof(uint8_t*));
+    for (int i = 0; i < bufcount; i++) {
+      keybufs[i] = malloc(32);
+      generate_key(keybufs[i]);
+    }
+
+    printf("Preparing %d random-filled 64 byte buffer...\n", bufcount);
+    uint8_t** bufs = calloc(bufcount, sizeof(uint8_t*));
+    for (int i = 0; i < bufcount; i++) {
+      bufs[i] = malloc(64);
+      getrandom_exact(bufs[i], 64);
+    }
+
+    printf("Performing authentication...\n");
+    struct poly1305_key *keys = aligned_alloc(alignof(struct poly1305_key), bufcount * sizeof(struct poly1305_key));
+    struct poly1305_tag tag;
+    memset(tag.nonce, 0, sizeof(tag.nonce));
+
+    struct timespec start, current;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    for (int i = 0; i < bufcount; i++) {
+      poly1305_prepare_key(keybufs[i], &keys[i]);
+    }
+
+    long iter = 0;
+    while (1) {
+      for (int p = 0; p < 16; p++) {
+        uint8_t b = ++tag.nonce[p];
+        if (b != 0) break;
+      }
+      poly1305_auth_once(&keys[iter & bufcount], bufs[iter % bufcount], 64,
+                         &tag);
+      clock_gettime(CLOCK_MONOTONIC, &current);
+      if (current.tv_sec > start.tv_sec && current.tv_nsec >= start.tv_nsec) {
+        break;
+      }
+      iter++;
+    }
+
+    current.tv_nsec -= start.tv_nsec;
+    current.tv_sec -= start.tv_sec;
+    if (current.tv_nsec < 0) {
+      current.tv_nsec += 1000000000LL;
+      current.tv_sec -= 1;
+    }
+    printf("Processed 64 byte messages: %ld\n", iter);
+    printf("Elapsed time: %jd.%09ld\n", (intmax_t) current.tv_sec, current.tv_nsec);
+
+    free(keys);
+    for (int i = 0; i < bufcount; i++) {
+      free(keybufs[i]);
+      free(bufs[i]);
+    }
+    free(keybufs);
+    free(bufs);
+  }
+  return 0;
 }

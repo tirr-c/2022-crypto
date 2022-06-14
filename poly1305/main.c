@@ -5,23 +5,9 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
-#include <sys/random.h>
 
 #include "poly1305.h"
 #include "../util.h"
-
-static int getrandom_exact(uint8_t* buf, size_t len) {
-  size_t count = 0;
-  while (count < len) {
-    ssize_t ret = getrandom(buf + count, len - count, 0);
-    if (ret < 0) {
-      if (errno == EINTR) continue;
-      return -1;
-    }
-    count += ret;
-  }
-  return 0;
-}
 
 int main(int argc, char** argv) {
   if (argc < 2 || argc >= 4) {
