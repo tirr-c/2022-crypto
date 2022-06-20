@@ -161,7 +161,7 @@ int main() {
   }
 
   printf("\n");
-  printf("Benchmark 2: single key, multiple short messages\n");
+  printf("Benchmark 3: multiple keys, multiple short messages\n");
   {
     int bufcount = 1024;
 
