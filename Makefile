@@ -1,11 +1,20 @@
-all: poly1305 hmac-sha256
+CFLAGS = -Wall -mavx2 -maes -O3
 
-.PHONY: poly1305 hmac-sha256
-poly1305 hmac-sha256:
-	$(MAKE) -C $@
+all: poly1305
+poly1305: main.o poly1305.o util.o
+	$(CC) $(LDFLAGS) -o $@ $(LDLIBS) $^
+
+.PHONY: test
+test: poly1305-test
+	./poly1305-test
+poly1305-test: tests.o poly1305.o util.o
+	$(CC) $(LDFLAGS) -o $@ $(LDLIBS) $^
+
+.PHONY: test-reference
+test-reference:
+	$(MAKE) -C ref test
 
 .PHONY: clean
 clean:
-	$(MAKE) -C poly1305 clean
-	$(MAKE) -C hmac-sha256 clean
-	rm -f *.o
+	$(MAKE) -C ref clean
+	rm -f *.o poly1305 poly1305-test

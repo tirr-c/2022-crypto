@@ -3,7 +3,7 @@
 #include <stdalign.h>
 #include <time.h>
 
-#include "../util.h"
+#include "util.h"
 #include "poly1305.h"
 
 static void generate_key(uint8_t* keybuf) {
@@ -196,7 +196,7 @@ int main() {
         uint8_t b = ++tag.nonce[p];
         if (b != 0) break;
       }
-      poly1305_auth_once(&keys[iter & bufcount], bufs[iter % bufcount], 64,
+      poly1305_auth_once(&keys[iter % bufcount], bufs[iter % bufcount], 64,
                          &tag);
       clock_gettime(CLOCK_MONOTONIC, &current);
       if (current.tv_sec > start.tv_sec && current.tv_nsec >= start.tv_nsec) {

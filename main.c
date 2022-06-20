@@ -7,7 +7,7 @@
 #include <errno.h>
 
 #include "poly1305.h"
-#include "../util.h"
+#include "util.h"
 
 int main(int argc, char** argv) {
   if (argc < 2 || argc >= 4) {

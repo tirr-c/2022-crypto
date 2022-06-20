@@ -2,7 +2,7 @@
 #include <string.h>
 #include <errno.h>
 
-#include "../util.h"
+#include "util.h"
 #include "poly1305.h"
 
 #define AES_ONCE(s, k, rcon, intr) { \
