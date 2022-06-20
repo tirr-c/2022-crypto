@@ -74,6 +74,19 @@ poly1305_round(__m256i h, __m256i c, __m256i r0, __m256i r1, __m256i r2, __m256i
   // h <- h + c
   h = _mm256_add_epi64(h, c);
 
+  // perform parallel carry
+  // here we compute 5*h3[63:34] = (1 + 4)*h3[63:34], as we're on p=2^130-5
+  // then rotate left once, in order to move carries to the right place
+  __m256i carry = _mm256_srlv_epi64(h, _mm256_set_epi64x(34, 32, 32, 32));
+  __m256i carry2 = _mm256_sllv_epi64(carry, _mm256_set_epi64x(2, 64, 64, 64));
+  carry = _mm256_add_epi64(carry, carry2);
+  carry = _mm256_permute4x64_epi64(carry, 0x93);
+
+  // mask out carries
+  __m256i mask = _mm256_set_epi64x(0x3ffffffffLL, 0xffffffffLL, 0xffffffffLL, 0xffffffffLL);
+  h = _mm256_and_si256(h, mask);
+  h = _mm256_add_epi64(h, carry);
+
   // AVX-2 doesn't have u64*u32 multiplication, so we must split 64-bit integers into two parts.
   // We have 4x u32*u32 -> u64 mult (vpmuludq), so split into two 32-bit integers.
   // Basically we compute h[31:0]*r[31:0] + ((h[63:32]*r[31:0]) << 32), then it's equivalent to
@@ -116,19 +129,7 @@ poly1305_round(__m256i h, __m256i c, __m256i r0, __m256i r1, __m256i r2, __m256i
   mu = _mm256_slli_epi64(mu, 32);
   ret = _mm256_add_epi32(ret, mu);
 
-  // now ret is r*h, perform parallel carry
-  // here we compute 5*h3[63:34] = (1 + 4)*h3[63:34], as we're on p=2^130-5
-  // then rotate left once, in order to move carries to the right place
-  __m256i carry = _mm256_srlv_epi64(ret, _mm256_set_epi64x(34, 32, 32, 32));
-  __m256i carry2 = _mm256_sllv_epi64(carry, _mm256_set_epi64x(2, 64, 64, 64));
-  carry = _mm256_add_epi64(carry, carry2);
-  carry = _mm256_permute4x64_epi64(carry, 0x93);
-
-  // mask out carries
-  __m256i mask = _mm256_set_epi64x(0x3ffffffffLL, 0xffffffffLL, 0xffffffffLL, 0xffffffffLL);
-  ret = _mm256_and_si256(ret, mask);
-
-  return _mm256_add_epi64(ret, carry);
+  return ret;
 }
 
 static __m256i poly1305_update(struct poly1305_key const* key,
