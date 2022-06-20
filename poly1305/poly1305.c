@@ -82,7 +82,6 @@ poly1305_round(__m256i h, __m256i c, __m256i r0, __m256i r1, __m256i r2, __m256i
   carry = _mm256_add_epi64(carry, carry2);
   carry = _mm256_permute4x64_epi64(carry, 0x93);
 
-  // mask out carries
   __m256i mask = _mm256_set_epi64x(0x3ffffffffLL, 0xffffffffLL, 0xffffffffLL, 0xffffffffLL);
   h = _mm256_and_si256(h, mask);
   h = _mm256_add_epi64(h, carry);
@@ -201,6 +200,8 @@ static void poly1305_finalize(struct poly1305_key const* key,
   }
 
   // Fully reduce in 2^130-5
+  // First, make h0, h1, h2 32-bit by performing serial carry
+  // (h < 2^130 + 2^128 < 2 * (2^130-5) after carry)
   unsigned long long h0 = _mm256_extract_epi64(h, 0);
   unsigned long long h1 = _mm256_extract_epi64(h, 1);
   unsigned long long h2 = _mm256_extract_epi64(h, 2);
@@ -214,14 +215,15 @@ static void poly1305_finalize(struct poly1305_key const* key,
   h3 += (h2 >> 32);
   h2 &= 0xffffffffULL;
 
-  // Need to subtract 2^130-5 if the result >= 2^130-5
+  // Need to subtract 2^130-5 if the h >= 2^130-5 (h is less than 2 * (2^130-5))
   // We do this by adding 5 and taking lower 130 bits, when h >= 2^130-5
-  // After that we add AES_k(n)
+  // After that we add AES_k(n) mod 2^128
   __m128i k = _mm_load_si128(&key->aes_k);
   __m128i n = _mm_loadu_si128((__m128i const*) &out->nonce);
   __m128i aes_n = poly1305_aes_k(k, n);
-  int need_subtract = (h3 > 0x3ffffffffULL) |
-    ((h3 == 0x3ffffffffULL) & (h2 == 0xffffffffULL) & (h1 == 0xffffffffULL) & (h0 >= 0xfffffffbULL));
+  int need_subtract = (h3 > 0x3ffffffffULL) |  // h >= 2^130, or
+    ((h3 == 0x3ffffffffULL) & (h2 == 0xffffffffULL) & (h1 == 0xffffffffULL) & (h0 >= 0xfffffffbULL)); // 2^130-5 <= h < 2^130
+  // need_subtract is 0 or 1
   h0 += need_subtract * 5 + (unsigned int) _mm_extract_epi32(aes_n, 0);
   tag[0] = h0;
   h1 += (h0 >> 32) + (unsigned int) _mm_extract_epi32(aes_n, 1);
